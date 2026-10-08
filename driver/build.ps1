@@ -39,12 +39,14 @@ Copy-Item "$wdk\Include\$sdkVersion\km\hidport.h" $obj
 
 $minor = $umdfVersion.Split('.')[1]
 $sources = 'winstadia.c', 'stadia.c', 'usb.c', 'bluetooth.c' | ForEach-Object { "$PSScriptRoot\$_" }
+& cl /nologo /W4 /O2 /MT /EHsc /std:c++17 /c /D UNICODE /D _UNICODE /D _WIN32_WINNT=0x0A00 /Fo"$obj\private-gatt.obj" "$PSScriptRoot\private-gatt.cpp"
+if ($LASTEXITCODE) { throw 'private GATT probe compiling failed' }
 & cl /nologo /W4 /O2 /MT /LD /std:c17 `
     /D UMDF_VERSION_MAJOR=2 /D UMDF_VERSION_MINOR=$minor /D UMDF_USING_NTSTATUS `
     /D UNICODE /D _UNICODE /D _WIN32_WINNT=0x0A00 `
     /I "$wdk\Include\wdf\umdf\$umdfVersion" /I $obj `
     /Fo"$obj\\" /Fe"$pkg\winstadia.dll" $sources `
-    /link /NOIMPLIB /NOEXP "$wdk\Lib\wdf\umdf\x64\$umdfVersion\WdfDriverStubUm.lib" ntdll.lib
+    /link /NOIMPLIB /NOEXP "$obj\private-gatt.obj" "$wdk\Lib\wdf\umdf\x64\$umdfVersion\WdfDriverStubUm.lib" ntdll.lib runtimeobject.lib ole32.lib
 if ($LASTEXITCODE) { throw 'compiling failed' }
 Copy-Item "$PSScriptRoot\winstadia.inf" $pkg
 # Windows only replaces an installed package when DriverVer is newer, so every

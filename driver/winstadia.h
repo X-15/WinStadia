@@ -8,6 +8,7 @@
 #include <wdf.h>
 #include <usb.h>
 #include <wdfusb.h>
+#include "private-gatt.h"
 
 // Controls of the presented pad: the payload of the gamepad input report,
 // followed by the guide button, which travels in a report of its own.
@@ -61,6 +62,11 @@ struct _DEVICE_CONTEXT {
     UCHAR RawReportLength;
     BOOLEAN RumbleFailed;
     NTSTATUS LastError;
+    HRESULT PrivateGattProbeStatus;
+    BOOLEAN PrivateGattProbeRan;
+    UINT64 BluetoothAddress;
+    void *PrivateGattSession;
+    STADIA_GATT_DIAGNOSTICS PrivateGattDiagnostics;
 
     // Serializes rumble writes so that the last value written wins.
     SRWLOCK RumbleLock;

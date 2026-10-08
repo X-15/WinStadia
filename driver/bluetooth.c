@@ -144,20 +144,62 @@ EvtBluetoothRetryTimer(WDFTIMER Timer)
 static NTSTATUS
 BluetoothSendOutputReport(PDEVICE_CONTEXT Context, PUCHAR Report, size_t Length)
 {
-    // A UMDF HID minidriver finds the report in the input buffer and the
-    // report ID in the length of the output buffer.
-    UCHAR unused[UCHAR_MAX];
-    WDF_MEMORY_DESCRIPTOR input;
-    WDF_MEMORY_DESCRIPTOR output;
-    WDF_REQUEST_SEND_OPTIONS options;
+    // Serialized by the caller's RumbleLock; input remains on the inbox path.
+    STADIA_GATT_DIAGNOSTICS diagnostics;
+    HRESULT hr;
+    if (!Context->PrivateGattSession) {
+        return STATUS_DEVICE_NOT_READY;
+    }
+    hr = StadiaPrivateGattWrite(Context->PrivateGattSession, Report, Length, &diagnostics);
+    AcquireSRWLockExclusive(&Context->Lock);
+    Context->PrivateGattDiagnostics = diagnostics;
+    ReleaseSRWLockExclusive(&Context->Lock);
+    // Diagnostic write status is an HRESULT; its sign also signals failure here.
+    return (NTSTATUS)hr;
+}
 
-    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&input, Report, (ULONG)Length);
-    WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&output, unused, Report[0]);
-    WDF_REQUEST_SEND_OPTIONS_INIT(&options, WDF_REQUEST_SEND_OPTION_TIMEOUT);
-    WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&options, WDF_REL_TIMEOUT_IN_MS(WRITE_TIMEOUT_MS));
-
-    return WdfIoTargetSendIoctlSynchronously(Context->LowerDriver, NULL, IOCTL_HID_WRITE_REPORT, &input, &output,
-                                             &options, NULL);
+static NTSTATUS
+GetBluetoothAddress(WDFDEVICE Device, UINT64 *Address)
+{
+    // Query this devnode's identity, rather than a fixed controller or GATT handle.
+    static const DEVPROPKEY instanceIdKey = {
+        {0x78c34fc8, 0x104a, 0x4aca, {0x9e, 0xa4, 0x52, 0x4d, 0x52, 0x99, 0x6e, 0x57}}, 256
+    };
+    WDF_DEVICE_PROPERTY_DATA property;
+    WDF_OBJECT_ATTRIBUTES attributes;
+    WDFMEMORY memory;
+    DEVPROPTYPE type;
+    NTSTATUS status;
+    size_t length;
+    WCHAR *id;
+    WCHAR *address;
+    WCHAR *end;
+    WDF_DEVICE_PROPERTY_DATA_INIT(&property, &instanceIdKey);
+    WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+    attributes.ParentObject = Device;
+    status = WdfDeviceAllocAndQueryPropertyEx(Device, &property, NonPagedPoolNx, &attributes, &memory, &type);
+    if (!NT_SUCCESS(status)) return status;
+    id = WdfMemoryGetBuffer(memory, &length);
+    if (type != DEVPROP_TYPE_STRING || length < sizeof(WCHAR) || id[length / sizeof(WCHAR) - 1] != L'\0') {
+        WdfObjectDelete(memory);
+        return STATUS_INVALID_PARAMETER;
+    }
+    address = wcsrchr(id, L'_');
+    if (!address || wcslen(address + 1) < 13 || address[13] != L'\\') {
+        WdfObjectDelete(memory);
+        return STATUS_INVALID_PARAMETER;
+    }
+    for (int i = 1; i <= 12; i++) {
+        WCHAR c = address[i];
+        if (!((c >= L'0' && c <= L'9') || (c >= L'A' && c <= L'F') || (c >= L'a' && c <= L'f'))) {
+            WdfObjectDelete(memory);
+            return STATUS_INVALID_PARAMETER;
+        }
+    }
+    *Address = _wcstoui64(address + 1, &end, 16);
+    status = *end == L'\\' && *Address != 0 ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER;
+    WdfObjectDelete(memory);
+    return status;
 }
 
 static NTSTATUS
@@ -197,6 +239,10 @@ BluetoothPrepareHardware(WDFDEVICE Device)
     }
 
     context->LowerDriver = WdfDeviceGetIoTarget(Device);
+    status = GetBluetoothAddress(Device, &context->BluetoothAddress);
+    if (!NT_SUCCESS(status)) {
+        context->PrivateGattProbeStatus = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+    }
     return STATUS_SUCCESS;
 }
 
@@ -207,6 +253,18 @@ BluetoothStart(PDEVICE_CONTEXT Context)
     if (!NT_SUCCESS(status)) {
         return status;
     }
+
+    AcquireSRWLockExclusive(&Context->RumbleLock);
+    StadiaPrivateGattClose(Context->PrivateGattSession);
+    Context->PrivateGattSession = NULL;
+    STADIA_GATT_DIAGNOSTICS diagnostics = {0};
+    HRESULT hr = StadiaPrivateGattOpen(Context->BluetoothAddress, &Context->PrivateGattSession, &diagnostics);
+    AcquireSRWLockExclusive(&Context->Lock);
+    Context->PrivateGattDiagnostics = diagnostics;
+    Context->PrivateGattProbeStatus = hr;
+    Context->PrivateGattProbeRan = TRUE;
+    ReleaseSRWLockExclusive(&Context->Lock);
+    ReleaseSRWLockExclusive(&Context->RumbleLock);
 
     AcquireSRWLockExclusive(&Context->Lock);
     Context->Reading = TRUE;
@@ -220,6 +278,10 @@ BluetoothStart(PDEVICE_CONTEXT Context)
 static VOID
 BluetoothStop(PDEVICE_CONTEXT Context)
 {
+    AcquireSRWLockExclusive(&Context->RumbleLock);
+    StadiaPrivateGattClose(Context->PrivateGattSession);
+    Context->PrivateGattSession = NULL;
+    ReleaseSRWLockExclusive(&Context->RumbleLock);
     AcquireSRWLockExclusive(&Context->Lock);
     Context->Reading = FALSE;
     ReleaseSRWLockExclusive(&Context->Lock);

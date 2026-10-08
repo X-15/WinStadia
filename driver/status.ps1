@@ -84,6 +84,15 @@ function Read-Status($handle) {
         RumbleFailed = $report[1] -ne 0
         Error        = [BitConverter]::ToUInt32($report, 2)
         RawReport    = ($raw | ForEach-Object { $_.ToString('X2') }) -join ' '
+        PrivateGattProbeRan = $report[24] -ne 0
+        PrivateGattProbeStatus = [BitConverter]::ToUInt32($report, 25)
+        PrivateGattWriteStatus = [BitConverter]::ToUInt32($report, 29)
+        PrivateGattValueHandle = [BitConverter]::ToUInt16($report, 33)
+        PrivateGattReportId = $report[35]
+        PrivateGattReportType = $report[36]
+        PrivateGattWrites = [BitConverter]::ToUInt32($report, 37)
+        PrivateGattStops = [BitConverter]::ToUInt32($report, 41)
+        BluetoothAddress = [BitConverter]::ToUInt64($report, 45)
     }
 }
 
@@ -94,6 +103,8 @@ try {
     if ($status.RumbleFailed) { $text += ', last rumble write failed' }
     if ($status.Error) { $text += ', last error 0x{0:X8}' -f $status.Error }
     "Driver: $text"
+    if ($status.PrivateGattProbeRan) { 'Private GATT probe in UMDF host: 0x{0:X8}' -f $status.PrivateGattProbeStatus }
+    'Private GATT: address={0:X12} report={1} type={2} value=0x{3:X4} writes={4} stops={5} writeHRESULT=0x{6:X8}' -f $status.BluetoothAddress,$status.PrivateGattReportId,$status.PrivateGattReportType,$status.PrivateGattValueHandle,$status.PrivateGattWrites,$status.PrivateGattStops,$status.PrivateGattWriteStatus
 
     if ($Watch) {
         'Raw input reports, press Ctrl+C to stop.'

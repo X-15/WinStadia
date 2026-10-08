@@ -395,6 +395,16 @@ GetFeature(PDEVICE_CONTEXT Context, WDFREQUEST Request)
     RtlCopyMemory(report + 2, &Context->LastError, sizeof(NTSTATUS));
     report[6] = Context->RawReportLength;
     RtlCopyMemory(report + 7, Context->RawReport, Context->RawReportLength);
+    // Extension after the 16-byte raw input region: private GATT access probe.
+    report[24] = Context->PrivateGattProbeRan;
+    RtlCopyMemory(report + 25, &Context->PrivateGattProbeStatus, sizeof(HRESULT));
+    RtlCopyMemory(report + 29, &Context->PrivateGattDiagnostics.WriteStatus, sizeof(HRESULT));
+    RtlCopyMemory(report + 33, &Context->PrivateGattDiagnostics.ValueHandle, sizeof(USHORT));
+    report[35] = Context->PrivateGattDiagnostics.ReportId;
+    report[36] = Context->PrivateGattDiagnostics.ReportType;
+    RtlCopyMemory(report + 37, &Context->PrivateGattDiagnostics.WriteCount, sizeof(ULONG));
+    RtlCopyMemory(report + 41, &Context->PrivateGattDiagnostics.StopCount, sizeof(ULONG));
+    RtlCopyMemory(report + 45, &Context->BluetoothAddress, sizeof(UINT64));
     ReleaseSRWLockShared(&Context->Lock);
     return CopyToRequest(Request, report, sizeof(report));
 }
