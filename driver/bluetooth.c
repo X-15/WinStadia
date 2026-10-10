@@ -1,12 +1,11 @@
 // Bluetooth transport: the inbox HID over GATT driver stays in the stack and
 // this driver sits on top of it, in the same driver host. It asks the driver
-// below for Stadia input reports the way the HID class driver would, and hands
-// it Stadia output reports.
+// below for Stadia input reports the way the HID class driver would. Stadia
+// output reports go around it, see BluetoothSendOutputReport.
 
 #include "winstadia.h"
 #include <hidport.h>
 
-#define WRITE_TIMEOUT_MS 2000
 #define RETRY_DELAY_MS 500
 // Room for any input report of the controller.
 #define READ_BUFFER_LEN 64
@@ -107,7 +106,7 @@ EvtBluetoothRetryTimer(WDFTIMER Timer)
     }
 }
 
-// Rumble does not work this way yet. The driver below fails the write with
+// Rumble does not go down the HID path. The driver below fails the write with
 // 0xC0070057 (invalid parameter), as it does for HidD_SetOutputReport on the
 // plain inbox stack. The likely reason is in the controller's GATT table: the
 // output report's characteristic (0x2A4D, value handle 0x0044) is declared
@@ -136,11 +135,16 @@ EvtBluetoothRetryTimer(WDFTIMER Timer)
 // while the other services are allowed. Reports of a plain GATT write
 // making the motors run come from macOS and Linux, whose stacks let user
 // mode at the HID service.
-// What is left is what the driver below uses itself: the WinRT class
+// What works is what the driver below uses itself: the WinRT class
 // Microsoft.Bluetooth.Profiles.Gatt.Interface.GattClientDevice, served by
 // bthserv, with GattClientCharacteristic and GattClientWriteResult next to
-// it. It is private, without metadata, so its interfaces would have to be
-// recovered from the inbox driver.
+// it. It is private, without metadata; private-gatt.cpp calls it by vtable
+// slot and writes the characteristic with response.
+//
+// The write waits for the controller's answer while the caller holds
+// RumbleLock, up to the two seconds private-gatt.cpp allows. Should that ever
+// stall games, a work item that writes the latest value would take it off the
+// HID path.
 static NTSTATUS
 BluetoothSendOutputReport(PDEVICE_CONTEXT Context, PUCHAR Report, size_t Length)
 {

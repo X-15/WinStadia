@@ -8,7 +8,7 @@ It is a UMDF driver. No kernel code, no test signing mode, no background process
 
 Xbox controllers on Bluetooth are HID gamepads, and the inbox filter driver xinputhid on top of their HID stack turns them into XInput devices. WinStadia is a HID transport minidriver at the bottom of the Stadia controller's HID stack. It presents the IDs, report descriptor and reports of an Xbox One S controller on Bluetooth, and its INF puts xinputhid on top, the way Microsoft's INF does for the real thing. Rumble travels the other way.
 
-On USB it replaces hidusb and talks to the interrupt endpoints through WinUSB. On Bluetooth it sits on top of the inbox HID over GATT driver and reads input reports from it the way the HID class driver would.
+On USB it replaces hidusb and talks to the interrupt endpoints through WinUSB. On Bluetooth it sits on top of the inbox HID over GATT driver and reads input reports from it the way the HID class driver would. Rumble goes around that driver, through the private Bluetooth interface it uses itself.
 
 | Stadia | Xbox |
 |---|---|
@@ -24,7 +24,7 @@ On USB it replaces hidusb and talks to the interrupt endpoints through WinUSB. O
 ## Limits
 
 - The report format xinputhid expects is undocumented. WinStadia copies a real controller, and a Windows update could break that.
-- No rumble over Bluetooth, use the cable. The inbox HID over GATT driver rejects the controller's output report as an invalid parameter, with or without WinStadia.
+- Rumble over Bluetooth calls a private Windows interface by vtable slot, recovered on build 26200 and seen working on 26220. A Windows update could break that too; the cable is unaffected.
 - Everything sees an Xbox controller, including Steam Input, browsers and Google's web tool for switching firmware. Uninstall before using that.
 - Capture and Assistant have no counterpart in XInput.
 - Games see an ordinary Xbox controller, with no kernel code or injection involved. What anti-cheat makes of it is still not guaranteed.
