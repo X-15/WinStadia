@@ -1,20 +1,22 @@
+// Writes HID output reports of a Bluetooth LE device through the GATT client
+// of bthserv, which Windows keeps to its own drivers.
+
 #pragma once
+
 #include <windows.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
-typedef struct _STADIA_GATT_DIAGNOSTICS {
-    HRESULT OpenStatus;
-    HRESULT WriteStatus;
-    ULONG WriteCount;
-    ULONG StopCount;
-    USHORT ValueHandle;
-    UCHAR ReportId;
-    UCHAR ReportType;
-} STADIA_GATT_DIAGNOSTICS;
-HRESULT StadiaPrivateGattOpen(UINT64 Address, void **Session, STADIA_GATT_DIAGNOSTICS *Diagnostics);
-HRESULT StadiaPrivateGattWrite(void *Session, const UCHAR *Report, size_t Length, STADIA_GATT_DIAGNOSTICS *Diagnostics);
-void StadiaPrivateGattClose(void *Session);
+
+typedef struct PRIVATE_GATT_SESSION PRIVATE_GATT_SESSION;
+
+// Finds the HID service's output report with that ID on the device.
+HRESULT PrivateGattOpen(UINT64 Address, UCHAR ReportId, PRIVATE_GATT_SESSION **Session);
+// Takes the report without its ID and waits for the device's answer.
+HRESULT PrivateGattWrite(PRIVATE_GATT_SESSION *Session, const UCHAR *Value, ULONG Length);
+VOID PrivateGattClose(PRIVATE_GATT_SESSION *Session);
+
 #ifdef __cplusplus
 }
 #endif

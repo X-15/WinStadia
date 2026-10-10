@@ -25,6 +25,7 @@
 #define BATTERY_REPORT_LEN 2
 #define MAX_INPUT_REPORT_LEN GAMEPAD_REPORT_LEN
 #define STATUS_REPORT_LEN 64
+#define STATUS_RUMBLE_WRITES_INDEX (7 + RAW_REPORT_MAX)
 
 // Rumble output report: [1] motor enable mask, [2] left trigger, [3] right
 // trigger, [4] strong, [5] weak, each 0..100, [6..9] timing, which the Stadia
@@ -389,22 +390,14 @@ GetFeature(PDEVICE_CONTEXT Context, WDFREQUEST Request)
     }
 
     // [1] rumble failed, [2..5] last error NTSTATUS (LE), [6] length of the
-    // last raw Stadia input report, [7..] that report
+    // last raw Stadia input report, [7..22] that report, [23..26] rumble
+    // writes that reached the controller (LE)
     AcquireSRWLockShared(&Context->Lock);
     report[1] = Context->RumbleFailed;
     RtlCopyMemory(report + 2, &Context->LastError, sizeof(NTSTATUS));
     report[6] = Context->RawReportLength;
     RtlCopyMemory(report + 7, Context->RawReport, Context->RawReportLength);
-    // Extension after the 16-byte raw input region: private GATT access probe.
-    report[24] = Context->PrivateGattProbeRan;
-    RtlCopyMemory(report + 25, &Context->PrivateGattProbeStatus, sizeof(HRESULT));
-    RtlCopyMemory(report + 29, &Context->PrivateGattDiagnostics.WriteStatus, sizeof(HRESULT));
-    RtlCopyMemory(report + 33, &Context->PrivateGattDiagnostics.ValueHandle, sizeof(USHORT));
-    report[35] = Context->PrivateGattDiagnostics.ReportId;
-    report[36] = Context->PrivateGattDiagnostics.ReportType;
-    RtlCopyMemory(report + 37, &Context->PrivateGattDiagnostics.WriteCount, sizeof(ULONG));
-    RtlCopyMemory(report + 41, &Context->PrivateGattDiagnostics.StopCount, sizeof(ULONG));
-    RtlCopyMemory(report + 45, &Context->BluetoothAddress, sizeof(UINT64));
+    RtlCopyMemory(report + STATUS_RUMBLE_WRITES_INDEX, &Context->RumbleWrites, sizeof(ULONG));
     ReleaseSRWLockShared(&Context->Lock);
     return CopyToRequest(Request, report, sizeof(report));
 }
@@ -511,6 +504,7 @@ EvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     WDF_PNPPOWER_EVENT_CALLBACKS pnpCallbacks;
     WDF_OBJECT_ATTRIBUTES attributes;
     WDF_IO_QUEUE_CONFIG queueConfig;
+    WDF_WORKITEM_CONFIG workItemConfig;
     WDFDEVICE device;
     WDFQUEUE queue;
     PDEVICE_CONTEXT context;
@@ -540,7 +534,16 @@ EvtDeviceAdd(WDFDRIVER Driver, PWDFDEVICE_INIT DeviceInit)
     InitializeSRWLock(&context->RumbleLock);
     RtlCopyMemory(context->Controls, IdleControls, PAD_CONTROLS_LEN);
 
-    // Parallel, so that a rumble write on the wire does not hold up reads.
+    WDF_WORKITEM_CONFIG_INIT(&workItemConfig, StadiaRumbleWorkItem);
+    workItemConfig.AutomaticSerialization = FALSE;
+    WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+    attributes.ParentObject = device;
+    status = WdfWorkItemCreate(&workItemConfig, &attributes, &context->RumbleWorkItem);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    // Parallel, so that no request holds up another.
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchParallel);
     queueConfig.EvtIoDeviceControl = EvtIoDeviceControl;
     status = WdfIoQueueCreate(device, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, &queue);

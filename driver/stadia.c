@@ -13,7 +13,6 @@
 //   [8..10] L2, R2 analog
 #define STADIA_INPUT_REPORT_ID 0x03
 #define STADIA_INPUT_REPORT_LEN 10
-#define STADIA_RUMBLE_REPORT_ID 0x05
 #define STADIA_HAT_RELEASED 8
 
 #define STADIA_B2_RS 0x80
@@ -115,29 +114,60 @@ StadiaInputReport(PDEVICE_CONTEXT Context, const UCHAR *Report, size_t Length)
 VOID
 StadiaSetRumble(PDEVICE_CONTEXT Context, UCHAR Strong, UCHAR Weak)
 {
-    // Motor speeds are 16 bit little endian; x * 257 scales 8 to 16 bits.
-    UCHAR report[] = {STADIA_RUMBLE_REPORT_ID, Strong, Strong, Weak, Weak};
-    NTSTATUS status;
+    BOOLEAN changed;
 
     // Games repeat the same output report a lot; only changes reach the wire.
-    AcquireSRWLockExclusive(&Context->RumbleLock);
-    if (Strong == Context->RumbleStrong && Weak == Context->RumbleWeak) {
-        ReleaseSRWLockExclusive(&Context->RumbleLock);
-        return;
-    }
-    status = Context->Transport->SendOutputReport(Context, report, sizeof(report));
-    if (NT_SUCCESS(status)) {
-        Context->RumbleStrong = Strong;
-        Context->RumbleWeak = Weak;
-    }
-    ReleaseSRWLockExclusive(&Context->RumbleLock);
-
     AcquireSRWLockExclusive(&Context->Lock);
-    Context->RumbleFailed = !NT_SUCCESS(status);
-    if (!NT_SUCCESS(status)) {
-        Context->LastError = status;
-    }
+    Context->RumbleStrong = Strong;
+    Context->RumbleWeak = Weak;
+    changed = Strong != Context->RumbleSentStrong || Weak != Context->RumbleSentWeak;
     ReleaseSRWLockExclusive(&Context->Lock);
+
+    // Does nothing while the work item is queued already.
+    if (changed) {
+        WdfWorkItemEnqueue(Context->RumbleWorkItem);
+    }
+}
+
+// Writes the motor speeds until the controller has those asked for. After a
+// failure it gives up; the next request from above tries again.
+VOID
+StadiaRumbleWorkItem(WDFWORKITEM WorkItem)
+{
+    PDEVICE_CONTEXT context = GetDeviceContext(WdfWorkItemGetParentObject(WorkItem));
+    NTSTATUS status = STATUS_SUCCESS;
+
+    AcquireSRWLockExclusive(&context->RumbleLock);
+    while (NT_SUCCESS(status)) {
+        UCHAR strong;
+        UCHAR weak;
+        BOOLEAN changed;
+
+        AcquireSRWLockShared(&context->Lock);
+        strong = context->RumbleStrong;
+        weak = context->RumbleWeak;
+        changed = strong != context->RumbleSentStrong || weak != context->RumbleSentWeak;
+        ReleaseSRWLockShared(&context->Lock);
+        if (!changed) {
+            break;
+        }
+
+        // Motor speeds are 16 bit little endian; x * 257 scales 8 to 16 bits.
+        UCHAR report[] = {STADIA_RUMBLE_REPORT_ID, strong, strong, weak, weak};
+        status = context->Transport->SendOutputReport(context, report, sizeof(report));
+
+        AcquireSRWLockExclusive(&context->Lock);
+        context->RumbleFailed = !NT_SUCCESS(status);
+        if (NT_SUCCESS(status)) {
+            context->RumbleSentStrong = strong;
+            context->RumbleSentWeak = weak;
+            context->RumbleWrites++;
+        } else {
+            context->LastError = status;
+        }
+        ReleaseSRWLockExclusive(&context->Lock);
+    }
+    ReleaseSRWLockExclusive(&context->RumbleLock);
 }
 
 NTSTATUS
@@ -157,10 +187,12 @@ StadiaD0Entry(WDFDEVICE Device, WDF_POWER_DEVICE_STATE PreviousState)
     UNREFERENCED_PARAMETER(PreviousState);
 
     // The motors are off after power up, whatever was requested before.
-    AcquireSRWLockExclusive(&context->RumbleLock);
+    AcquireSRWLockExclusive(&context->Lock);
     context->RumbleStrong = 0;
     context->RumbleWeak = 0;
-    ReleaseSRWLockExclusive(&context->RumbleLock);
+    context->RumbleSentStrong = 0;
+    context->RumbleSentWeak = 0;
+    ReleaseSRWLockExclusive(&context->Lock);
 
     return context->Transport->Start(context);
 }
@@ -174,6 +206,7 @@ StadiaD0Exit(WDFDEVICE Device, WDF_POWER_DEVICE_STATE TargetState)
 
     // Fails harmlessly when the controller is already gone.
     StadiaSetRumble(context, 0, 0);
+    WdfWorkItemFlush(context->RumbleWorkItem);
     context->Transport->Stop(context);
     return STATUS_SUCCESS;
 }

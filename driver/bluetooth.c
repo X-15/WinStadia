@@ -1,12 +1,14 @@
 // Bluetooth transport: the inbox HID over GATT driver stays in the stack and
 // this driver sits on top of it, in the same driver host. It asks the driver
 // below for Stadia input reports the way the HID class driver would. Stadia
-// output reports go around it, see BluetoothSendOutputReport.
+// output reports go around it, through bthserv; further down is why.
 
 #include "winstadia.h"
 #include <hidport.h>
 
 #define RETRY_DELAY_MS 500
+#define GATT_REOPEN_DELAY_MS 3000
+#define BLUETOOTH_ADDRESS_DIGITS 12
 // Room for any input report of the controller.
 #define READ_BUFFER_LEN 64
 
@@ -140,68 +142,93 @@ EvtBluetoothRetryTimer(WDFTIMER Timer)
 // bthserv, with GattClientCharacteristic and GattClientWriteResult next to
 // it. It is private, without metadata; private-gatt.cpp calls it by vtable
 // slot and writes the characteristic with response.
-//
-// The write waits for the controller's answer while the caller holds
-// RumbleLock, up to the two seconds private-gatt.cpp allows. Should that ever
-// stall games, a work item that writes the latest value would take it off the
-// HID path.
+
+static VOID
+CloseGattSession(PDEVICE_CONTEXT Context)
+{
+    PrivateGattClose(Context->GattSession);
+    Context->GattSession = NULL;
+}
+
+// Opens the session rumble is written through, unless there is one. The
+// caller holds RumbleLock.
+static HRESULT
+OpenGattSession(PDEVICE_CONTEXT Context)
+{
+    if (Context->GattSession != NULL) {
+        return S_OK;
+    }
+    // An attempt takes seconds to fail, and games write rumble all the time.
+    if (Context->GattOpenTick != 0 && GetTickCount64() - Context->GattOpenTick < GATT_REOPEN_DELAY_MS) {
+        return Context->GattOpenStatus;
+    }
+    Context->GattOpenStatus =
+        PrivateGattOpen(Context->BluetoothAddress, STADIA_RUMBLE_REPORT_ID, &Context->GattSession);
+    Context->GattOpenTick = GetTickCount64();
+    return Context->GattOpenStatus;
+}
+
+// Waits for the controller's answer, up to the two seconds private-gatt.cpp
+// allows. The status is an HRESULT, which tells failure by its sign as well.
 static NTSTATUS
 BluetoothSendOutputReport(PDEVICE_CONTEXT Context, PUCHAR Report, size_t Length)
 {
-    // Serialized by the caller's RumbleLock; input remains on the inbox path.
-    STADIA_GATT_DIAGNOSTICS diagnostics;
+    BOOLEAN started;
     HRESULT hr;
-    if (!Context->PrivateGattSession) {
+
+    AcquireSRWLockShared(&Context->Lock);
+    started = Context->Reading;
+    ReleaseSRWLockShared(&Context->Lock);
+    if (!started) {
         return STATUS_DEVICE_NOT_READY;
     }
-    hr = StadiaPrivateGattWrite(Context->PrivateGattSession, Report, Length, &diagnostics);
-    AcquireSRWLockExclusive(&Context->Lock);
-    Context->PrivateGattDiagnostics = diagnostics;
-    ReleaseSRWLockExclusive(&Context->Lock);
-    // Diagnostic write status is an HRESULT; its sign also signals failure here.
+
+    hr = OpenGattSession(Context);
+    if (SUCCEEDED(hr)) {
+        // The report ID is in the characteristic's Report Reference
+        // descriptor, not in its value.
+        hr = PrivateGattWrite(Context->GattSession, Report + 1, (ULONG)(Length - 1));
+        if (FAILED(hr)) {
+            // The session may have gone stale; the next write opens another.
+            CloseGattSession(Context);
+        }
+    }
     return (NTSTATUS)hr;
 }
 
 static NTSTATUS
 GetBluetoothAddress(WDFDEVICE Device, UINT64 *Address)
 {
-    // Query this devnode's identity, rather than a fixed controller or GATT handle.
-    static const DEVPROPKEY instanceIdKey = {
-        {0x78c34fc8, 0x104a, 0x4aca, {0x9e, 0xa4, 0x52, 0x4d, 0x52, 0x99, 0x6e, 0x57}}, 256
+    // DEVPKEY_Bluetooth_DeviceAddress: twelve hex digits.
+    static const DEVPROPKEY addressKey = {
+        {0x2bd67d8b, 0x8beb, 0x48d5, {0x87, 0xe0, 0x6c, 0xda, 0x34, 0x28, 0x04, 0x0a}}, 1
     };
     WDF_DEVICE_PROPERTY_DATA property;
     WDF_OBJECT_ATTRIBUTES attributes;
     WDFMEMORY memory;
     DEVPROPTYPE type;
     NTSTATUS status;
-    size_t length;
-    WCHAR *id;
-    WCHAR *address;
+    size_t size;
+    WCHAR *text;
     WCHAR *end;
-    WDF_DEVICE_PROPERTY_DATA_INIT(&property, &instanceIdKey);
+
+    WDF_DEVICE_PROPERTY_DATA_INIT(&property, &addressKey);
     WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
     attributes.ParentObject = Device;
     status = WdfDeviceAllocAndQueryPropertyEx(Device, &property, NonPagedPoolNx, &attributes, &memory, &type);
-    if (!NT_SUCCESS(status)) return status;
-    id = WdfMemoryGetBuffer(memory, &length);
-    if (type != DEVPROP_TYPE_STRING || length < sizeof(WCHAR) || id[length / sizeof(WCHAR) - 1] != L'\0') {
-        WdfObjectDelete(memory);
-        return STATUS_INVALID_PARAMETER;
+    if (!NT_SUCCESS(status)) {
+        return status;
     }
-    address = wcsrchr(id, L'_');
-    if (!address || wcslen(address + 1) < 13 || address[13] != L'\\') {
-        WdfObjectDelete(memory);
-        return STATUS_INVALID_PARAMETER;
-    }
-    for (int i = 1; i <= 12; i++) {
-        WCHAR c = address[i];
-        if (!((c >= L'0' && c <= L'9') || (c >= L'A' && c <= L'F') || (c >= L'a' && c <= L'f'))) {
-            WdfObjectDelete(memory);
-            return STATUS_INVALID_PARAMETER;
+
+    status = STATUS_INVALID_PARAMETER;
+    text = WdfMemoryGetBuffer(memory, &size);
+    if (type == DEVPROP_TYPE_STRING && size == (BLUETOOTH_ADDRESS_DIGITS + 1) * sizeof(WCHAR) &&
+        text[BLUETOOTH_ADDRESS_DIGITS] == L'\0') {
+        *Address = _wcstoui64(text, &end, 16);
+        if (end == text + BLUETOOTH_ADDRESS_DIGITS && *Address != 0) {
+            status = STATUS_SUCCESS;
         }
     }
-    *Address = _wcstoui64(address + 1, &end, 16);
-    status = *end == L'\\' && *Address != 0 ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER;
     WdfObjectDelete(memory);
     return status;
 }
@@ -242,33 +269,24 @@ BluetoothPrepareHardware(WDFDEVICE Device)
         return status;
     }
 
-    context->LowerDriver = WdfDeviceGetIoTarget(Device);
+    // Only rumble needs the address, so input works without.
     status = GetBluetoothAddress(Device, &context->BluetoothAddress);
     if (!NT_SUCCESS(status)) {
-        context->PrivateGattProbeStatus = HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+        StadiaRecordError(context, status);
     }
+
+    context->LowerDriver = WdfDeviceGetIoTarget(Device);
     return STATUS_SUCCESS;
 }
 
 static NTSTATUS
 BluetoothStart(PDEVICE_CONTEXT Context)
 {
+    HRESULT hr;
     NTSTATUS status = WdfIoTargetStart(Context->LowerDriver);
     if (!NT_SUCCESS(status)) {
         return status;
     }
-
-    AcquireSRWLockExclusive(&Context->RumbleLock);
-    StadiaPrivateGattClose(Context->PrivateGattSession);
-    Context->PrivateGattSession = NULL;
-    STADIA_GATT_DIAGNOSTICS diagnostics = {0};
-    HRESULT hr = StadiaPrivateGattOpen(Context->BluetoothAddress, &Context->PrivateGattSession, &diagnostics);
-    AcquireSRWLockExclusive(&Context->Lock);
-    Context->PrivateGattDiagnostics = diagnostics;
-    Context->PrivateGattProbeStatus = hr;
-    Context->PrivateGattProbeRan = TRUE;
-    ReleaseSRWLockExclusive(&Context->Lock);
-    ReleaseSRWLockExclusive(&Context->RumbleLock);
 
     AcquireSRWLockExclusive(&Context->Lock);
     Context->Reading = TRUE;
@@ -276,19 +294,31 @@ BluetoothStart(PDEVICE_CONTEXT Context)
     for (int i = 0; i < BLUETOOTH_READER_COUNT; i++) {
         SendRead(&Context->Readers[i]);
     }
+
+    // Now, so that the first rumble of a game does not wait for it. Should it
+    // fail, as it may right after the controller connected, the writes try
+    // again.
+    AcquireSRWLockExclusive(&Context->RumbleLock);
+    Context->GattOpenTick = 0;
+    hr = OpenGattSession(Context);
+    ReleaseSRWLockExclusive(&Context->RumbleLock);
+    if (FAILED(hr)) {
+        StadiaRecordError(Context, (NTSTATUS)hr);
+    }
     return STATUS_SUCCESS;
 }
 
 static VOID
 BluetoothStop(PDEVICE_CONTEXT Context)
 {
-    AcquireSRWLockExclusive(&Context->RumbleLock);
-    StadiaPrivateGattClose(Context->PrivateGattSession);
-    Context->PrivateGattSession = NULL;
-    ReleaseSRWLockExclusive(&Context->RumbleLock);
     AcquireSRWLockExclusive(&Context->Lock);
     Context->Reading = FALSE;
     ReleaseSRWLockExclusive(&Context->Lock);
+
+    // A write that slips in after this finds Reading cleared and opens none.
+    AcquireSRWLockExclusive(&Context->RumbleLock);
+    CloseGattSession(Context);
+    ReleaseSRWLockExclusive(&Context->RumbleLock);
 
     // A retry that slips in after this finds Reading cleared and does nothing.
     WdfTimerStop(Context->RetryTimer, TRUE);
