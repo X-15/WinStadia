@@ -26,25 +26,43 @@ EvtUsbInputReport(WDFUSBPIPE Pipe, WDFMEMORY Buffer, size_t NumBytesTransferred,
     StadiaInputReport(Context, WdfMemoryGetBuffer(Buffer, NULL), NumBytesTransferred);
 }
 
-BOOLEAN
-EvtUsbReadersFailed(WDFUSBPIPE Pipe, NTSTATUS Status, USBD_STATUS UsbdStatus)
+static VOID
+UsbReaderFailed(PDEVICE_CONTEXT Context, NTSTATUS Status, USBD_STATUS UsbdStatus)
 {
-    PDEVICE_CONTEXT context = GetDeviceContext(WdfIoTargetGetDevice(WdfUsbTargetPipeGetIoTarget(Pipe)));
+    AcquireSRWLockExclusive(&Context->Lock);
+    Context->LastError = Status;
+    Context->LastUsbdStatus = UsbdStatus;
+    Context->ReaderFailures++;
+    ReleaseSRWLockExclusive(&Context->Lock);
 
-    UNREFERENCED_PARAMETER(UsbdStatus);
-
-    StadiaRecordError(context, Status);
     // No input arrives from here on, so games must not keep seeing the
     // buttons the controller last reported as held.
-    PadReleaseControls(context);
+    PadReleaseControls(Context);
 
     // Returning TRUE asks the framework to reset the pipe and restart the
     // reader, but in UMDF it never does: it first checks that the port is
     // connected, and FxUsbDevice::IsConnected always fails in user mode. The
     // reader then stayed down until the controller was replugged. The work
     // item recovers instead.
-    WdfWorkItemEnqueue(context->RecoveryWorkItem);
+    WdfWorkItemEnqueue(Context->RecoveryWorkItem);
+}
+
+BOOLEAN
+EvtUsbReadersFailed(WDFUSBPIPE Pipe, NTSTATUS Status, USBD_STATUS UsbdStatus)
+{
+    UsbReaderFailed(GetDeviceContext(WdfIoTargetGetDevice(WdfUsbTargetPipeGetIoTarget(Pipe))), Status, UsbdStatus);
     return FALSE;
+}
+
+static VOID
+CountRecovery(PDEVICE_CONTEXT Context, ULONG *Counter, NTSTATUS Status)
+{
+    AcquireSRWLockExclusive(&Context->Lock);
+    (*Counter)++;
+    if (!NT_SUCCESS(Status)) {
+        Context->LastError = Status;
+    }
+    ReleaseSRWLockExclusive(&Context->Lock);
 }
 
 // Resets the input pipe and restarts the reader. When that fails, or the
@@ -81,12 +99,13 @@ EvtUsbRecovery(WDFWORKITEM WorkItem)
         if (NT_SUCCESS(status)) {
             status = WdfIoTargetStart(input);
         }
+        CountRecovery(context, &context->PipeResets, status);
         if (NT_SUCCESS(status)) {
             return;
         }
-        StadiaRecordError(context, status);
     }
 
+    CountRecovery(context, &context->DeviceRestarts, STATUS_SUCCESS);
     WdfDeviceSetFailed(device, WdfDeviceFailedAttemptRestart);
 }
 
@@ -197,4 +216,12 @@ UsbStop(PDEVICE_CONTEXT Context)
     WdfIoTargetStop(WdfUsbTargetPipeGetIoTarget(Context->InputPipe), WdfIoTargetCancelSentIo);
 }
 
-const TRANSPORT UsbTransport = {UsbPrepareHardware, UsbStart, UsbStop, UsbSendOutputReport};
+// For status.ps1 -TestRecovery: goes through a reader failure without one.
+static NTSTATUS
+UsbTestRecovery(PDEVICE_CONTEXT Context)
+{
+    UsbReaderFailed(Context, STATUS_UNSUCCESSFUL, 0);
+    return STATUS_SUCCESS;
+}
+
+const TRANSPORT UsbTransport = {UsbPrepareHardware, UsbStart, UsbStop, UsbSendOutputReport, UsbTestRecovery};

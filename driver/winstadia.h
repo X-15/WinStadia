@@ -35,6 +35,8 @@ typedef struct _TRANSPORT {
     VOID (*Stop)(PDEVICE_CONTEXT Context);
     // The report starts with its ID. May block; the caller holds RumbleLock.
     NTSTATUS (*SendOutputReport)(PDEVICE_CONTEXT Context, PUCHAR Report, size_t Length);
+    // Runs the recovery from a failed input reader; NULL where there is none.
+    NTSTATUS (*TestRecovery)(PDEVICE_CONTEXT Context);
 } TRANSPORT;
 
 extern const TRANSPORT UsbTransport;
@@ -66,6 +68,13 @@ struct _DEVICE_CONTEXT {
     BOOLEAN RumbleFailed;
     NTSTATUS LastError;
     ULONG RumbleWrites;
+    // Every input report from the transport, changed or not.
+    ULONG InputReports;
+    // USB input reader failures and what was done about them.
+    USBD_STATUS LastUsbdStatus;
+    ULONG ReaderFailures;
+    ULONG PipeResets;
+    ULONG DeviceRestarts;
 
     // Motor speeds: those asked for and those the controller has, both
     // guarded by the lock. The work item writes the difference, so that a
