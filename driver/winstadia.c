@@ -313,6 +313,12 @@ PadPublishControls(PDEVICE_CONTEXT Context, const UCHAR *Controls)
     ReleaseSRWLockExclusive(&Context->Lock);
 }
 
+VOID
+PadReleaseControls(PDEVICE_CONTEXT Context)
+{
+    PadPublishControls(Context, IdleControls);
+}
+
 static NTSTATUS
 ReadReport(PDEVICE_CONTEXT Context, WDFREQUEST Request, BOOLEAN *Complete)
 {

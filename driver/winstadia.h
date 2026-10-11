@@ -85,6 +85,11 @@ struct _DEVICE_CONTEXT {
     // then go through the control endpoint.
     WDFUSBPIPE OutputPipe;
     UCHAR InterfaceNumber;
+    // Brings the input pipe back after the reader failed. Running is guarded
+    // by the lock, the tick of the last recovery belongs to the work item.
+    WDFWORKITEM RecoveryWorkItem;
+    BOOLEAN UsbRunning;
+    ULONGLONG LastRecoveryTick;
 
     // Bluetooth transport.
     WDFIOTARGET LowerDriver;
@@ -104,6 +109,9 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetDeviceContext)
 
 // Publishes new control values as input reports, if they changed.
 VOID PadPublishControls(PDEVICE_CONTEXT Context, const UCHAR *Controls);
+// Publishes all controls released and centered, for when input stops
+// arriving, so that games do not keep the last buttons held.
+VOID PadReleaseControls(PDEVICE_CONTEXT Context);
 
 EVT_WDF_DEVICE_PREPARE_HARDWARE StadiaPrepareHardware;
 EVT_WDF_DEVICE_D0_ENTRY StadiaD0Entry;
